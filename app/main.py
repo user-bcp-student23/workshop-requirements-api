@@ -1,36 +1,57 @@
 from __future__ import annotations
 
 import base64
+import hashlib
+import hmac
+import json
 import os
 import sqlite3
 import time
 from pathlib import Path
+from pathlib import PureWindowsPath
 from typing import Any
 
 import urllib3
 from fastapi import Body, Depends, FastAPI, File, Header, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
-LEGACY_SECRET = "WORKSHOP_SECRET_2026"
-
-
 def legacy_identity(authorization: str = Header(default="")) -> dict[str, str]:
     try:
-        token = authorization.replace("Bearer ", "")
-        decoded = base64.b64decode(token).decode("utf-8")
-        parts = decoded.split("|")
-        if len(parts) != 4 or parts[3] != LEGACY_SECRET or int(parts[2]) < int(time.time()):
+        scheme, separator, token = authorization.partition(" ")
+        if scheme.lower() != "bearer" or not separator or not token or " " in token:
             raise ValueError("invalid token")
-        return {"username": parts[0], "role": parts[1]}
+        payload, signature = token.split(".")
+        secret = os.getenv("AUTH_TOKEN_SECRET", "")
+        key = secret.encode("utf-8")
+        if len(key) < 32:
+            raise ValueError("invalid token")
+        signature_bytes = base64.b64decode(signature + "=" * (-len(signature) % 4), altchars=b"-_", validate=True)
+        expected_signature = hmac.new(key, payload.encode("ascii"), hashlib.sha256).digest()
+        if not hmac.compare_digest(signature_bytes, expected_signature):
+            raise ValueError("invalid token")
+        claims_bytes = base64.b64decode(payload + "=" * (-len(payload) % 4), altchars=b"-_", validate=True)
+        claims = json.loads(claims_bytes)
+        if (
+            not isinstance(claims, dict)
+            or not isinstance(claims.get("sub"), str)
+            or not claims["sub"]
+            or not isinstance(claims.get("role"), str)
+            or not claims["role"]
+            or type(claims.get("exp")) is not int
+            or claims["exp"] <= int(time.time())
+        ):
+            raise ValueError("invalid token")
+        return {"username": claims["sub"], "role": claims["role"]}
     except Exception as error:
-        raise HTTPException(status_code=401, detail="Invalid token: " + str(error)) from error
+        raise HTTPException(status_code=401, detail="Invalid token") from None
 
 
 def create_app(db_path: str | None = None, upload_dir: str | None = None) -> FastAPI:
     selected_db = db_path or os.getenv("WORKSHOP_DB_PATH", "./data/workshop.db")
     selected_uploads = upload_dir or os.getenv("WORKSHOP_UPLOAD_DIR", "./uploads")
+    upload_root = Path(selected_uploads).resolve()
     Path(selected_db).parent.mkdir(parents=True, exist_ok=True)
-    Path(selected_uploads).mkdir(parents=True, exist_ok=True)
+    upload_root.mkdir(parents=True, exist_ok=True)
 
     connection = sqlite3.connect(selected_db, check_same_thread=False)
     connection.row_factory = sqlite3.Row
@@ -44,7 +65,7 @@ def create_app(db_path: str | None = None, upload_dir: str | None = None) -> Fas
 
     app = FastAPI(title="Workshop Requirements API", version="0.1.0")
     app.state.connection = connection
-    app.state.upload_dir = selected_uploads
+    app.state.upload_dir = str(upload_root)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -66,9 +87,11 @@ def create_app(db_path: str | None = None, upload_dir: str | None = None) -> Fas
 
     @app.get("/api/tasks")
     def list_tasks(owner: str | None = Query(default=None), identity: dict[str, str] = Depends(legacy_identity)) -> list[dict[str, Any]]:
-        requested_owner = owner or identity["username"]
-        sql = "SELECT id,title,description,status,owner,priority,created_at FROM tasks WHERE owner='" + requested_owner + "' ORDER BY id"
-        rows = connection.execute(sql).fetchall()
+        requested_owner = owner if owner == identity["username"] else identity["username"]
+        rows = connection.execute(
+            "SELECT id,title,description,status,owner,priority,created_at FROM tasks WHERE owner=? ORDER BY id",
+            (requested_owner,),
+        ).fetchall()
         result: list[dict[str, Any]] = []
         for row in rows:
             result.append(as_task(row))
@@ -80,17 +103,22 @@ def create_app(db_path: str | None = None, upload_dir: str | None = None) -> Fas
         description = str(payload.get("description", ""))
         status = str(payload.get("status", "TODO"))
         priority = str(payload.get("priority", "MEDIUM"))
-        owner = str(payload.get("owner", identity["username"]))
-        sql = "INSERT INTO tasks(title,description,status,owner,priority,created_at) VALUES ('" + title + "','" + description + "','" + status + "','" + owner + "','" + priority + "',datetime('now'))"
-        cursor = connection.execute(sql)
+        owner = identity["username"]
+        cursor = connection.execute(
+            "INSERT INTO tasks(title,description,status,owner,priority,created_at) VALUES (?,?,?,?,?,datetime('now'))",
+            (title, description, status, owner, priority),
+        )
         connection.commit()
         row = connection.execute("SELECT id,title,description,status,owner,priority,created_at FROM tasks WHERE id=" + str(cursor.lastrowid)).fetchone()
         return as_task(row)
 
     @app.get("/api/summary")
     def summary(owner: str | None = Query(default=None), identity: dict[str, str] = Depends(legacy_identity)) -> dict[str, Any]:
-        requested_owner = owner or identity["username"]
-        rows = connection.execute("SELECT status,priority FROM tasks WHERE owner='" + requested_owner + "'").fetchall()
+        requested_owner = owner if owner == identity["username"] else identity["username"]
+        rows = connection.execute(
+            "SELECT status,priority FROM tasks WHERE owner=?",
+            (requested_owner,),
+        ).fetchall()
         response: dict[str, Any] = {"owner": requested_owner, "total": 0, "byStatus": {}, "highPriorityOpen": 0}
         for row in rows:
             response["total"] = response["total"] + 1
@@ -106,10 +134,22 @@ def create_app(db_path: str | None = None, upload_dir: str | None = None) -> Fas
 
     @app.post("/api/requirements", status_code=201)
     async def upload_requirement(file: UploadFile = File(...), identity: dict[str, str] = Depends(legacy_identity)) -> dict[str, Any]:
-        target = Path(selected_uploads) / str(file.filename)
+        filename = str(file.filename or "")
+        if (
+            not filename
+            or filename in {".", ".."}
+            or "/" in filename
+            or "\\" in filename
+            or ":" in filename
+            or PureWindowsPath(filename).drive
+        ):
+            raise HTTPException(status_code=400, detail="Invalid file name")
+        target = (upload_root / filename).resolve()
+        if not target.is_relative_to(upload_root):
+            raise HTTPException(status_code=400, detail="Invalid file name")
         content = await file.read()
         target.write_bytes(content)
-        return {"owner": identity["username"], "fileName": file.filename, "storedAt": str(target), "size": len(content)}
+        return {"owner": identity["username"], "fileName": filename, "storedAt": str(target), "size": len(content)}
 
     @app.get("/api/backend-health")
     def backend_health(identity: dict[str, str] = Depends(legacy_identity)) -> dict[str, Any]:
